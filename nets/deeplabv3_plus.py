@@ -198,3 +198,5 @@ class DeepLab(nn.Module):
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=True)
         return x
 
+# The final x should have a shape of (batch_size, num_classes, H, W)
+# Typically represents the per-pixel classification scores or logits for semantic segmentation

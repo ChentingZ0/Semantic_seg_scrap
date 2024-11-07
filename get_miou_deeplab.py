@@ -34,7 +34,7 @@ if __name__ == "__main__":
     #   默认指向根目录下的VOC数据集
     #-------------------------------------------------------#
     # VOCdevkit_path  = 'VOCdevkit'
-    Iron_path = 'Iron_dataset'
+    Iron_path = 'SCRAP_V6'
     image_ids       = open(os.path.join(Iron_path, "Iron_material/ImageSets/Segmentation/val.txt"),'r').read().splitlines()
     gt_dir          = os.path.join(Iron_path, "Iron_material/SegmentationClass/")
     miou_out_path   = "miou_out"

@@ -10,13 +10,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from nets.deeplabv3_plus import DeepLab
-from nets.deeplabv3_training import (get_lr_scheduler, set_optimizer_lr,
-                                     weights_init)
+from nets.deeplabv3_loss import (get_lr_scheduler, set_optimizer_lr,
+                                 weights_init)
+from nets.UperNet import UperNetSwin
 from utils.callbacks import EvalCallback, LossHistory
 from utils.dataloader import DeeplabDataset, deeplab_dataset_collate
 from utils.utils import (download_weights, seed_everything, show_config,
                          worker_init_fn)
 from utils.utils_fit import fit_one_epoch
+from transformers import UperNetForSemanticSegmentation
 
 import os
 
@@ -85,13 +87,17 @@ if __name__ == "__main__":
     #---------------------------------#
     # backbone        = "xception"
     # backbone          = "mobilenet"
-    backbone          = "swintransformerv2"
+    # backbone          = "swintransformerv2"
+    backbone          = "swintransformer_tiny"
     #----------------------------------------------------------------------------------------------------------------------------#
     #   pretrained      是否使用主干网络的预训练权重，此处使用的是主干的权重，因此是在模型构建的时候进行加载的。
     #                   如果设置了model_path，则主干的权值无需加载，pretrained的值无意义。
     #                   如果不设置model_path，pretrained = True，此时仅加载主干开始训练。
     #                   如果不设置model_path，pretrained = False，Freeze_Train = Fasle，此时从0开始训练，且没有冻结主干的过程。
     #----------------------------------------------------------------------------------------------------------------------------#
+    # decode_head       = "deeplabv3+"
+    decode_head       = "UperNet"
+
     pretrained      = True
     #----------------------------------------------------------------------------------------------------------------------------#
     #   权值文件的下载请看README，可以通过网盘下载。模型的 预训练权重 对不同数据集是通用的，因为特征是通用的。
@@ -114,7 +120,9 @@ if __name__ == "__main__":
     # model_path      = "model_data/deeplab_mobilenetv2.pth"
     # model_path      = "model_data/deeplab_xception.pth"
     # model_path      = "logs/last_epoch_weights.pth"
-    model_path      = "model_data/swinv2_cr_tiny_ns_224_backbone.pth"
+    # model_path      = "model_data/swinv2_cr_tiny_ns_224_backbone.pth"
+    # model_path      = "model_data/upernet-swin-tiny.pth"
+    model_path      = "model_data/upernet-swin-tiny-backbone.pth"
     #---------------------------------------------------------#
     #   downsample_factor   下采样的倍数8、16 
     #                       8下采样的倍数较小、理论上效果更好。
@@ -124,8 +132,8 @@ if __name__ == "__main__":
     #------------------------------#
     #   输入图片的大小
     #------------------------------#
-    # input_shape         = [512, 512]
-    input_shape         = [224, 224]
+    input_shape         = [512, 512]
+    # input_shape         = [224, 224]
 
 
     #----------------------------------------------------------------------------------------------------------------------------#
@@ -170,7 +178,7 @@ if __name__ == "__main__":
     #                       (当Freeze_Train=False时失效)
     #------------------------------------------------------------------#
     Init_Epoch          = 0
-    Freeze_Epoch        = 100
+    Freeze_Epoch        = 200
     Freeze_batch_size   = 8
 
     #------------------------------------------------------------------#
@@ -239,9 +247,7 @@ if __name__ == "__main__":
     # VOCdevkit_path  = 'VOCdevkit'
 
     # customed dataset 路径
-    Iron_path = 'Iron_dataset'
-    # 984 all: 885 training, 99 val(original)
-    # (after augmentation )
+    Iron_path = 'SCRAP_V6'
 
     #------------------------------------------------------------------#
     #   建议选项：
@@ -263,10 +269,10 @@ if __name__ == "__main__":
     #------------------------------------------------------------------#
     #   Higher weights for underrepresented classes
     #   Can add inverse count of each class as weight parameter
-    # cls_weights     = np.ones([num_classes], np.float32)
-    pixel_class = np.array([583924202, 84414114, 63487299, 75559217])
-    cls_weights = 1 / pixel_class
-    cls_weights = cls_weights.astype(np.float32)
+    cls_weights     = np.ones([num_classes], np.float32)
+    # pixel_class = np.array([583924202, 84414114, 63487299, 75559217])
+    # cls_weights = 1 / pixel_class
+    # cls_weights = cls_weights.astype(np.float32)
     #------------------------------------------------------------------#
     #   num_workers     用于设置是否使用多线程读取数据，1代表关闭多线程
     #                   开启后会加快数据读取速度，但是会占用更多内存
@@ -293,49 +299,73 @@ if __name__ == "__main__":
         local_rank      = 0
         rank            = 0
 
-    #----------------------------------------------------#
+    # ----------------------------------------------------#
     #   下载预训练权重
-    #----------------------------------------------------#
-    if backbone != "swintransformerv2":
-        if pretrained:
-            if distributed:
-                if local_rank == 0:
+    # ----------------------------------------------------#
+    if decode_head == "deeplabv3+":
+        model = DeepLab(num_classes=num_classes, backbone=backbone, downsample_factor=downsample_factor,
+                        pretrained=pretrained)
+        if backbone != "swintransformerv2" or backbone != "swintransformer_large" or backbone != "swintransformer_base":
+            if pretrained:
+                if distributed:
+                    if local_rank == 0:
+                        download_weights(backbone)
+                    dist.barrier()
+                else:
                     download_weights(backbone)
-                dist.barrier()
-            else:
-                download_weights(backbone)
+        if not pretrained:
+            weights_init(model)
 
-    model   = DeepLab(num_classes=num_classes, backbone=backbone, downsample_factor=downsample_factor, pretrained=pretrained)
-    if not pretrained:
-        weights_init(model)
-    if model_path != '':
-        if local_rank == 0:
-            print('Load weights {}.'.format(model_path))
-        
-        #------------------------------------------------------#
-        #   根据预训练权重的Key和模型的Key进行加载
-        #------------------------------------------------------#
-        model_dict      = model.state_dict()
-        pretrained_dict = torch.load(model_path, map_location = device)
 
-        load_key, no_load_key, temp_dict = [], [], {}
-        for k, v in pretrained_dict.items():
-            if k in model_dict.keys() and np.shape(model_dict[k]) == np.shape(v):
-                temp_dict[k] = v
-                load_key.append(k)
-            else:
-                no_load_key.append(k)
+        if model_path != '':
+            if local_rank == 0:
+                print('Load weights {}.'.format(model_path))
 
-        model_dict.update(temp_dict)
-        model.load_state_dict(model_dict)
-        #------------------------------------------------------#
-        #   显示没有匹配上的Key
-        #------------------------------------------------------#
+            #------------------------------------------------------#
+            #   根据预训练权重的Key和模型的Key进行加载
+            #------------------------------------------------------#
+            model_dict      = model.state_dict()
+            pretrained_dict = torch.load(model_path, map_location = device)
+
+            load_key, no_load_key, temp_dict = [], [], {}
+            for k, v in pretrained_dict.items():
+                if k in model_dict.keys() and np.shape(model_dict[k]) == np.shape(v):
+                    temp_dict[k] = v
+                    load_key.append(k)
+                else:
+                    no_load_key.append(k)
+
+            model_dict.update(temp_dict)
+            model.load_state_dict(model_dict)
+            #------------------------------------------------------#
+            #   显示没有匹配上的Key
+            #------------------------------------------------------#
         if local_rank == 0:
             print("\nSuccessful Load Key:", str(load_key)[:500], "……\nSuccessful Load Key Num:", len(load_key))
             print("\nFail To Load Key:", str(no_load_key)[:500], "……\nFail To Load Key num:", len(no_load_key))
             print("\n\033[1;33;44m温馨提示，head部分没有载入是正常现象，Backbone部分没有载入是错误的。\033[0m")
+    elif decode_head == "UperNet":
+            model = UperNetSwin(num_classes=num_classes, backbone=backbone, pretrained=True)
+            #-------------------------------------------------------#
+            print('Load weights {}.'.format(model_path))
+            #------------------------------------------------------#
+            #   根据预训练权重的Key和模型的Key进行加载
+            #------------------------------------------------------#
+            pretrained_model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-swin-tiny")
+            pretrained_state_dict = pretrained_model.state_dict()
+            # Filter out keys related to decode_head and auxiliary_head
+            backbone_state_dict = {k: v for k, v in pretrained_state_dict.items() if
+                                   not (k.startswith("decode_head.") or k.startswith("auxiliary_head."))}
 
+            # Load only the filtered state_dict into your modified model
+            model.load_state_dict(backbone_state_dict, strict=False)
+
+            for key, param in model.state_dict().items():
+                if param.numel() > 0 and torch.sum(param).item() != 0:
+                    print(key)
+
+    else:
+        print("wrong decode head")
     #----------------------#
     #   记录Loss
     #----------------------#
@@ -373,14 +403,10 @@ if __name__ == "__main__":
             model_train = torch.nn.DataParallel(model)
             cudnn.benchmark = True
             model_train = model_train.cuda()
-    
+
     #---------------------------#
     #   读取数据集对应的txt
     #---------------------------#
-    # with open(os.path.join(VOCdevkit_path, "VOC2007/ImageSets/Segmentation/train_without_merge.txt"),"r") as f:
-    #     train_lines = f.readlines()
-    # with open(os.path.join(VOCdevkit_path, "VOC2007/ImageSets/Segmentation/val.txt"),"r") as f:
-    #     val_lines = f.readlines()
 
     with open(os.path.join(Iron_path, "Iron_material/ImageSets/Segmentation/train.txt"),"r") as f:
         train_lines = f.readlines()
@@ -392,7 +418,7 @@ if __name__ == "__main__":
 
     if local_rank == 0:
         show_config(
-            num_classes = num_classes, backbone = backbone, model_path = model_path, input_shape = input_shape, \
+            num_classes = num_classes, backbone = backbone, decode_head = decode_head, model_path = model_path, input_shape = input_shape, \
             Init_Epoch = Init_Epoch, Freeze_Epoch = Freeze_Epoch, UnFreeze_Epoch = UnFreeze_Epoch, Freeze_batch_size = Freeze_batch_size, Unfreeze_batch_size = Unfreeze_batch_size, Freeze_Train = Freeze_Train, \
             Init_lr = Init_lr, Min_lr = Min_lr, optimizer_type = optimizer_type, momentum = momentum, lr_decay_type = lr_decay_type, \
             save_period = save_period, save_dir = save_dir, num_workers = num_workers, num_train = num_train, num_val = num_val
@@ -427,7 +453,7 @@ if __name__ == "__main__":
         #   冻结一定部分训练
         #------------------------------------#
         if Freeze_Train:
-            for param in model.backbone.parameters():
+            for param in model.model.backbone.parameters():
                 param.requires_grad = False
 
         #-------------------------------------------------------------------#
@@ -451,8 +477,8 @@ if __name__ == "__main__":
         #   根据optimizer_type选择优化器
         #---------------------------------------#
         optimizer = {
-            'adam'  : optim.Adam(model.parameters(), Init_lr_fit, betas = (momentum, 0.999), weight_decay = weight_decay),
-            'sgd'   : optim.SGD(model.parameters(), Init_lr_fit, momentum = momentum, nesterov=True, weight_decay = weight_decay)
+            'adam'  : optim.Adam(model.model.parameters(), Init_lr_fit, betas = (momentum, 0.999), weight_decay = weight_decay),
+            'sgd'   : optim.SGD(model.model.parameters(), Init_lr_fit, momentum = momentum, nesterov=True, weight_decay = weight_decay)
         }[optimizer_type]
 
         #---------------------------------------#
@@ -469,8 +495,6 @@ if __name__ == "__main__":
         if epoch_step == 0 or epoch_step_val == 0:
             raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
 
-        # train_dataset   = DeeplabDataset(train_lines, input_shape, num_classes, True, VOCdevkit_path)
-        # val_dataset     = DeeplabDataset(val_lines, input_shape, num_classes, False, VOCdevkit_path)
         train_dataset   = DeeplabDataset(train_lines, input_shape, num_classes, True, Iron_path)
         val_dataset     = DeeplabDataset(val_lines, input_shape, num_classes, False, Iron_path)
 
@@ -487,7 +511,7 @@ if __name__ == "__main__":
         gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
                                     drop_last = True, collate_fn = deeplab_dataset_collate, sampler=train_sampler, 
                                     worker_init_fn=partial(worker_init_fn, rank=rank, seed=seed))
-        gen_val         = DataLoader(val_dataset  , shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True, 
+        gen_val         = DataLoader(val_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
                                     drop_last = True, collate_fn = deeplab_dataset_collate, sampler=val_sampler, 
                                     worker_init_fn=partial(worker_init_fn, rank=rank, seed=seed))
 
@@ -527,7 +551,7 @@ if __name__ == "__main__":
                 #---------------------------------------#
                 lr_scheduler_func = get_lr_scheduler(lr_decay_type, Init_lr_fit, Min_lr_fit, UnFreeze_Epoch)
                     
-                for param in model.backbone.parameters():
+                for param in model.model.backbone.parameters():
                     param.requires_grad = True
                             
                 epoch_step      = num_train // batch_size
